@@ -7,7 +7,10 @@
 #include "IOCTLHandlers.h"
 #include "LoadableModules.h"
 
+#include "PTE.h"
+
 #include "../API/MemoryUtils.h"
+#include "../API/PteUtils.h"
 #include "../API/ProcessesUtils.h"
 #include "../API/SectionsUtils.h"
 #include "../API/IO.h"
@@ -17,6 +20,7 @@
 #include "../API/StringsAPI.h"
 #include "../API/Signatures.h"
 #include "../API/PCI.h"
+#include "../API/Hypervisor.h"
 
 #include "IOCTLs.h"
 
@@ -473,14 +477,21 @@ namespace
 
         if (!Input->Size) return STATUS_SUCCESS;
 
-        VirtualMemory::CopyMemory(
-            reinterpret_cast<PVOID>(Input->Dest),
-            reinterpret_cast<PVOID>(Input->Src),
-            Input->Size, 
-            Input->Intersects
-        );
+        BOOLEAN Status = FALSE; 
+        __try {
+            Status = VirtualMemory::CopyMemory(
+                reinterpret_cast<PVOID>(Input->Dest),
+                reinterpret_cast<PVOID>(Input->Src),
+                Input->Size,
+                Input->Intersects,
+                TRUE
+            );
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return STATUS_UNSUCCESSFUL;
+        }
 
-        return STATUS_SUCCESS;
+        return Status ? STATUS_SUCCESS : STATUS_MEMORY_NOT_ALLOCATED;
     }
 
     NTSTATUS FASTCALL KbFillMemory(IN PIOCTL_INFO RequestInfo, OUT PSIZE_T ResponseLength) 
@@ -493,7 +504,18 @@ namespace
         auto Input = static_cast<PKB_FILL_MEMORY_IN>(RequestInfo->InputBuffer);
         if (!Input || !Input->Address) return STATUS_INVALID_PARAMETER;
 
-        RtlFillMemory(reinterpret_cast<PVOID>(Input->Address), Input->Size, Input->Filler);
+        PVOID Address = reinterpret_cast<PVOID>(Input->Address);
+
+        using namespace VirtualMemory;
+        using namespace AddressRange;
+        if (IsKernelAddress(Address) && !IsMemoryRangePresent(Address, Input->Size))
+            return STATUS_MEMORY_NOT_ALLOCATED;
+
+        __try {
+            RtlFillMemory(reinterpret_cast<PVOID>(Input->Address), Input->Size, Input->Filler);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return STATUS_UNSUCCESSFUL;
+        }
 
         return STATUS_SUCCESS;
     }
@@ -508,13 +530,31 @@ namespace
         auto Input = static_cast<PKB_EQUAL_MEMORY_IN>(RequestInfo->InputBuffer);
         if (!Input || !Input->Src || !Input->Dest || !RequestInfo->OutputBuffer) return STATUS_INVALID_PARAMETER;
 
-        static_cast<PKB_EQUAL_MEMORY_OUT>(RequestInfo->OutputBuffer)->Equals = RtlEqualMemory(
-            reinterpret_cast<PVOID>(Input->Src), 
-            reinterpret_cast<PVOID>(Input->Dest), 
-            Input->Size
-        );
+        PVOID Src = reinterpret_cast<PVOID>(Input->Src);
+        PVOID Dest = reinterpret_cast<PVOID>(Input->Dest);
+
+        using namespace VirtualMemory;
+        using namespace AddressRange;
+
+        if (IsKernelAddress(Src) && !IsMemoryRangePresent(Src, Input->Size))
+            return STATUS_MEMORY_NOT_ALLOCATED;
+
+        if (IsKernelAddress(Dest) && !IsMemoryRangePresent(Dest, Input->Size))
+            return STATUS_MEMORY_NOT_ALLOCATED;
 
         *ResponseLength = RequestInfo->OutputBufferSize;
+
+        __try {
+            static_cast<PKB_EQUAL_MEMORY_OUT>(RequestInfo->OutputBuffer)->Equals = RtlEqualMemory(
+                reinterpret_cast<PVOID>(Input->Src),
+                reinterpret_cast<PVOID>(Input->Dest),
+                Input->Size
+            );
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            static_cast<PKB_EQUAL_MEMORY_OUT>(RequestInfo->OutputBuffer)->Equals = FALSE;
+            return STATUS_UNSUCCESSFUL;
+        }
+
         return STATUS_SUCCESS;
     }
 
@@ -622,8 +662,8 @@ namespace
             &Mapping,
             SrcProcess,
             DestProcess,
-            Input->NeedLock,
-            static_cast<KPROCESSOR_MODE>(Input->AccessMode),
+            Input->NeedProbeAndLock,
+            static_cast<KPROCESSOR_MODE>(Input->MapToAddressSpace),
             Input->Protect,
             static_cast<MEMORY_CACHING_TYPE>(Input->CacheType),
             reinterpret_cast<PVOID>(Input->UserRequestedAddress)
@@ -741,7 +781,7 @@ namespace
             DestProcess,
             reinterpret_cast<PVOID>(Input->VirtualAddress),
             Input->Size,
-            static_cast<KPROCESSOR_MODE>(Input->AccessMode),
+            static_cast<KPROCESSOR_MODE>(Input->MapToAddressSpace),
             Input->Protect,
             static_cast<MEMORY_CACHING_TYPE>(Input->CacheType),
             reinterpret_cast<PVOID>(Input->UserRequestedAddress)
@@ -1147,6 +1187,84 @@ namespace
         return ZwClose(reinterpret_cast<HANDLE>(Input->Handle));        
     }
 
+    NTSTATUS FASTCALL KbQueryInformationProcess(IN PIOCTL_INFO RequestInfo, OUT PSIZE_T ResponseLength)
+    {
+        UNREFERENCED_PARAMETER(ResponseLength);
+
+        if (RequestInfo->InputBufferSize != sizeof(KB_QUERY_INFORMATION_PROCESS_THREAD_IN))
+            return STATUS_INFO_LENGTH_MISMATCH;
+
+        if (!RequestInfo->InputBuffer) return STATUS_INVALID_PARAMETER;
+
+        auto Input = static_cast<PKB_QUERY_INFORMATION_PROCESS_THREAD_IN>(RequestInfo->InputBuffer);
+
+        return Processes::Information::QueryInformationProcess(
+            reinterpret_cast<HANDLE>(Input->Handle),
+            static_cast<PROCESSINFOCLASS>(Input->InfoClass),
+            reinterpret_cast<PVOID>(Input->Buffer),
+            Input->Size,
+            reinterpret_cast<PULONG>(Input->ReturnLength)
+        );
+    }
+
+    NTSTATUS FASTCALL KbSetInformationProcess(IN PIOCTL_INFO RequestInfo, OUT PSIZE_T ResponseLength)
+    {
+        UNREFERENCED_PARAMETER(ResponseLength);
+
+        if (RequestInfo->InputBufferSize != sizeof(KB_SET_INFORMATION_PROCESS_THREAD_IN))
+            return STATUS_INFO_LENGTH_MISMATCH;
+
+        if (!RequestInfo->InputBuffer) return STATUS_INVALID_PARAMETER;
+
+        auto Input = static_cast<PKB_SET_INFORMATION_PROCESS_THREAD_IN>(RequestInfo->InputBuffer);
+
+        return Processes::Information::SetInformationProcess(
+            reinterpret_cast<HANDLE>(Input->Handle),
+            static_cast<PROCESSINFOCLASS>(Input->InfoClass),
+            reinterpret_cast<PVOID>(Input->Buffer),
+            Input->Size
+        );
+    }
+
+    NTSTATUS FASTCALL KbQueryInformationThread(IN PIOCTL_INFO RequestInfo, OUT PSIZE_T ResponseLength)
+    {
+        UNREFERENCED_PARAMETER(ResponseLength);
+
+        if (RequestInfo->InputBufferSize != sizeof(KB_QUERY_INFORMATION_PROCESS_THREAD_IN))
+            return STATUS_INFO_LENGTH_MISMATCH;
+
+        if (!RequestInfo->InputBuffer) return STATUS_INVALID_PARAMETER;
+
+        auto Input = static_cast<PKB_QUERY_INFORMATION_PROCESS_THREAD_IN>(RequestInfo->InputBuffer);
+
+        return Processes::Threads::QueryInformationThread(
+            reinterpret_cast<HANDLE>(Input->Handle),
+            static_cast<THREADINFOCLASS>(Input->InfoClass),
+            reinterpret_cast<PVOID>(Input->Buffer),
+            Input->Size,
+            reinterpret_cast<PULONG>(Input->ReturnLength)
+        );
+    }
+
+    NTSTATUS FASTCALL KbSetInformationThread(IN PIOCTL_INFO RequestInfo, OUT PSIZE_T ResponseLength)
+    {
+        UNREFERENCED_PARAMETER(ResponseLength);
+
+        if (RequestInfo->InputBufferSize != sizeof(KB_SET_INFORMATION_PROCESS_THREAD_IN))
+            return STATUS_INFO_LENGTH_MISMATCH;
+
+        if (!RequestInfo->InputBuffer) return STATUS_INVALID_PARAMETER;
+
+        auto Input = static_cast<PKB_SET_INFORMATION_PROCESS_THREAD_IN>(RequestInfo->InputBuffer);
+
+        return Processes::Threads::SetInformationThread(
+            reinterpret_cast<HANDLE>(Input->Handle),
+            static_cast<THREADINFOCLASS>(Input->InfoClass),
+            reinterpret_cast<PVOID>(Input->Buffer),
+            Input->Size
+        );
+    }
+
     NTSTATUS FASTCALL KbAllocUserMemory(IN PIOCTL_INFO RequestInfo, OUT PSIZE_T ResponseLength)
     {
         if (
@@ -1289,10 +1407,10 @@ namespace
     {
         UNREFERENCED_PARAMETER(ResponseLength);
 
-        if (RequestInfo->InputBufferSize != sizeof(KB_READ_WRITE_PROCESS_MEMORY_IN))
+        if (RequestInfo->InputBufferSize != sizeof(KB_READ_PROCESS_MEMORY_IN))
             return STATUS_INFO_LENGTH_MISMATCH;
 
-        auto Input = static_cast<PKB_READ_WRITE_PROCESS_MEMORY_IN>(RequestInfo->InputBuffer);
+        auto Input = static_cast<PKB_READ_PROCESS_MEMORY_IN>(RequestInfo->InputBuffer);
         if (!Input) return STATUS_INVALID_PARAMETER;
 
         HANDLE ProcessId = Input->ProcessId ? reinterpret_cast<HANDLE>(Input->ProcessId) : PsGetCurrentProcessId();
@@ -1315,19 +1433,37 @@ namespace
     {
         UNREFERENCED_PARAMETER(ResponseLength);
 
-        if (RequestInfo->InputBufferSize != sizeof(KB_READ_WRITE_PROCESS_MEMORY_IN))
+        if (RequestInfo->InputBufferSize != sizeof(KB_WRITE_PROCESS_MEMORY_IN))
             return STATUS_INFO_LENGTH_MISMATCH;
 
-        auto Input = static_cast<PKB_READ_WRITE_PROCESS_MEMORY_IN>(RequestInfo->InputBuffer);
+        auto Input = static_cast<PKB_WRITE_PROCESS_MEMORY_IN>(RequestInfo->InputBuffer);
         if (!Input) return STATUS_INVALID_PARAMETER;
 
         HANDLE ProcessId = Input->ProcessId ? reinterpret_cast<HANDLE>(Input->ProcessId) : PsGetCurrentProcessId();
         PEPROCESS Process = Processes::Descriptors::GetEPROCESS(ProcessId);
         if (!Process) return STATUS_UNSUCCESSFUL;
 
+        PVOID Address = reinterpret_cast<PVOID>(Input->BaseAddress);
+        SIZE_T Size = Input->Size;
+        if (Input->PerformCopyOnWrite) {
+            using namespace Pte;
+            PVOID PageCounter = Address;
+            do {   
+                ULONG PageSize = 0;
+                BOOLEAN Status = TriggerCopyOnWrite(Process, PageCounter, &PageSize);
+                if (!Status || !PageSize) {
+                    ObDereferenceObject(Process);
+                    return STATUS_PARTIAL_COPY;
+                }
+                PageCounter = reinterpret_cast<PVOID>(
+                    reinterpret_cast<SIZE_T>(ALIGN_DOWN_POINTER_BY(PageCounter, PageSize)) + PageSize
+                );
+            } while (PageCounter < reinterpret_cast<PVOID>(reinterpret_cast<SIZE_T>(Address) + Size));
+        }
+
         NTSTATUS Status = Processes::MemoryManagement::WriteProcessMemory(
             Process,
-            reinterpret_cast<PVOID>(Input->BaseAddress),
+            Address,
             reinterpret_cast<PVOID>(Input->Buffer),
             Input->Size
         );
@@ -1820,6 +1956,20 @@ namespace
         return STATUS_SUCCESS;
     }
 
+    NTSTATUS FASTCALL KbVmmEnable(IN PIOCTL_INFO RequestInfo, OUT PSIZE_T ResponseLength)
+    {
+        UNREFERENCED_PARAMETER(RequestInfo);
+        UNREFERENCED_PARAMETER(ResponseLength);
+        return Hypervisor::Virtualize() ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    }
+
+    NTSTATUS FASTCALL KbVmmDisable(IN PIOCTL_INFO RequestInfo, OUT PSIZE_T ResponseLength)
+    {
+        UNREFERENCED_PARAMETER(RequestInfo);
+        UNREFERENCED_PARAMETER(ResponseLength);
+        return Hypervisor::Devirtualize() ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    }
+
     NTSTATUS FASTCALL KbExecuteShellCode(IN PIOCTL_INFO RequestInfo, OUT PSIZE_T ResponseLength)
     {
         if (
@@ -2282,50 +2432,58 @@ NTSTATUS FASTCALL DispatchIOCTL(IN PIOCTL_INFO RequestInfo, OUT PSIZE_T Response
         /* 53 */ KbOpenThreadByPointer,
         /* 54 */ KbDereferenceObject,
         /* 55 */ KbCloseHandle,
-        /* 56 */ KbAllocUserMemory,
-        /* 57 */ KbFreeUserMemory,
-        /* 58 */ KbSecureVirtualMemory,
-        /* 59 */ KbUnsecureVirtualMemory,
-        /* 60 */ KbReadProcessMemory,
-        /* 61 */ KbWriteProcessMemory,
-        /* 62 */ KbSuspendProcess,
-        /* 63 */ KbResumeProcess,
-        /* 64 */ KbGetThreadContext,
-        /* 65 */ KbSetThreadContext,
-        /* 66 */ KbCreateUserThread,
-        /* 67 */ KbCreateSystemThread,
-        /* 68 */ KbQueueUserApc,
-        /* 69 */ KbRaiseIopl,
-        /* 70 */ KbResetIopl,
-        /* 71 */ KbGetProcessCr3Cr4,
+        /* 56 */ KbQueryInformationProcess,
+        /* 57 */ KbSetInformationProcess,
+        /* 58 */ KbQueryInformationThread,
+        /* 59 */ KbSetInformationThread,
+        /* 60 */ KbAllocUserMemory,
+        /* 61 */ KbFreeUserMemory,
+        /* 62 */ KbSecureVirtualMemory,
+        /* 63 */ KbUnsecureVirtualMemory,
+        /* 64 */ KbReadProcessMemory,
+        /* 65 */ KbWriteProcessMemory,
+        /* 66 */ KbSuspendProcess,
+        /* 67 */ KbResumeProcess,
+        /* 68 */ KbGetThreadContext,
+        /* 69 */ KbSetThreadContext,
+        /* 70 */ KbCreateUserThread,
+        /* 71 */ KbCreateSystemThread,
+        /* 72 */ KbQueueUserApc,
+        /* 73 */ KbRaiseIopl,
+        /* 74 */ KbResetIopl,
+        /* 75 */ KbGetProcessCr3Cr4,
 
         // Sections:
-        /* 72 */ KbCreateSection,
-        /* 73 */ KbOpenSection,
-        /* 74 */ KbMapViewOfSection,
-        /* 75 */ KbUnmapViewOfSection,
+        /* 76 */ KbCreateSection,
+        /* 77 */ KbOpenSection,
+        /* 78 */ KbMapViewOfSection,
+        /* 79 */ KbUnmapViewOfSection,
 
         // Loadable modules:
-        /* 76 */ KbCreateDriver,
-        /* 77 */ KbLoadModule,
-        /* 78 */ KbGetModuleHandle,
-        /* 79 */ KbCallModule,
-        /* 80 */ KbUnloadModule,
+        /* 80 */ KbCreateDriver,
+        /* 81 */ KbLoadModule,
+        /* 82 */ KbGetModuleHandle,
+        /* 83 */ KbCallModule,
+        /* 84 */ KbUnloadModule,
 
         // PCI:
-        /* 81 */ KbReadPciConfig,
-        /* 82 */ KbWritePciConfig,
+        /* 85 */ KbReadPciConfig,
+        /* 86 */ KbWritePciConfig,
+
+        // Hypervisor:
+        /* 87 */ KbVmmEnable,
+        /* 88 */ KbVmmDisable,
 
         // Stuff u kn0w:
-        /* 83 */ KbExecuteShellCode,
-        /* 84 */ KbGetKernelProcAddress,
-        /* 85 */ KbStallExecutionProcessor,
-        /* 86 */ KbBugCheck,
-        /* 87 */ KbFindSignature
+        /* 89 */ KbExecuteShellCode,
+        /* 90 */ KbGetKernelProcAddress,
+        /* 91 */ KbStallExecutionProcessor,
+        /* 92 */ KbBugCheck,
+        /* 93 */ KbFindSignature
     };
 
     USHORT Index = EXTRACT_CTL_CODE(RequestInfo->ControlCode) - CTL_BASE;
-    return Index < sizeof(Handlers) / sizeof(Handlers[0]) 
-        ? Handlers[Index](RequestInfo, ResponseLength) 
+    return Index < sizeof(Handlers) / sizeof(Handlers[0])
+        ? Handlers[Index](RequestInfo, ResponseLength)
         : STATUS_NOT_IMPLEMENTED;
 }
